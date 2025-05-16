@@ -46,3 +46,8 @@ def check_line_exists(grid: Int[Tensor, "h w"], target_value: int, line_length: 
                 return True
     
     return False
+
+
+def assert_equal(a, b, custom_prefix: str = "assert_equal failed"):
+    if a != b:
+        raise AssertionError(f"{custom_prefix}: {a} != {b}")

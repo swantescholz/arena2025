@@ -2,10 +2,13 @@
 import itertools
 import os
 import sys
+import random
 import time
 import warnings
 from dataclasses import dataclass, astuple
 from typing import Literal
+import numpy as np
+from utils import *
 
 import einops
 import matplotlib.pyplot as plt
@@ -66,8 +69,6 @@ class PPOArgs:
 
 
 args = PPOArgs(num_minibatches=2)
-
-print("hello world")
 
 # %%
 
@@ -227,8 +228,8 @@ class ReplayMemory:
         for data, expected_shape in zip(
             [obs, actions, logprobs, values, rewards, terminated], [self.obs_shape, self.action_shape, (), (), (), ()]
         ):
-            assert isinstance(data, np.ndarray)
-            assert data.shape == (self.num_envs, *expected_shape)
+            assert_equal(type(data), np.ndarray)
+            assert_equal(data.shape, (self.num_envs, *expected_shape))
 
         # Add data to buffer (not slicing off old elements)
         self.obs = np.concatenate((self.obs, obs[None, :]))
@@ -247,7 +248,7 @@ class ReplayMemory:
         """
         # Convert everything to tensors on the correct device
         obs, actions, logprobs, values, rewards, terminated = (
-            t.tensor(x, device=device)
+            t.tensor(x, device=device, dtype=t.float)
             for x in [self.obs, self.actions, self.logprobs, self.values, self.rewards, self.terminated]
         )
 
@@ -278,7 +279,6 @@ class StepResult:
     obs: Float[Arr, "num_envs *obs_shape"]
     rewards: Float[Arr, "num_envs"]
     terminated: Bool[Arr, "num_envs"]
-    infos: list[dict] = [] # num_envs
 
 ME_RADIUS = 0.05
 BALL_RADIUS = 0.4
@@ -287,8 +287,8 @@ class EnvVector:
     """
     Vectorized environment.
     """
-    def __init__(self):
-        self.num_envs = 5
+    def __init__(self, num_envs: int):
+        self.num_envs = num_envs
         self.obs = np.zeros((NUM_OBS, self.num_envs))
         self.obs[OBS_BALL_X] = -3
         self.obs[OBS_BALL_Y] = -2
@@ -339,7 +339,7 @@ class PPOAgent:
         self.memory = memory
 
         self.step = 0  # Tracking number of steps taken (across all environments)
-        self.next_obs = t.tensor((envs.num_envs, NUM_OBS), device=device, dtype=t.float)  # need starting obs (in tensor form)
+        self.next_obs = t.tensor(envs.obs.T, device=device, dtype=t.float)  # need starting obs (in tensor form)
         self.next_terminated = t.zeros(envs.num_envs, device=device, dtype=t.bool)  # need starting termination=False
 
     def play_step(self) -> list[dict]:
@@ -359,7 +359,8 @@ class PPOAgent:
         actions = dist.sample() # samples one action for each env
 
         # Step environment based on the sampled action
-        next_obs, rewards, next_terminated, infos = astuple(self.envs.step(actions.cpu().numpy()))
+        next_obs, rewards, next_terminated = astuple(self.envs.step(actions.cpu().numpy()))
+        next_obs = next_obs.T
 
         # Calculate logprobs and values, and add this all to replay memory
         logprobs = dist.log_prob(actions).cpu().numpy()
@@ -372,7 +373,7 @@ class PPOAgent:
         self.next_terminated = t.from_numpy(next_terminated).to(device, dtype=t.float)
 
         self.step += self.envs.num_envs
-        return infos
+        return []
 
     def get_minibatches(self, gamma: float, gae_lambda: float) -> list[ReplayMinibatch]:
         """
@@ -482,144 +483,97 @@ def make_optimizer(
     scheduler = PPOScheduler(optimizer, initial_lr, end_lr, total_phases)
     return optimizer, scheduler
 
+def set_global_seeds(seed):
+    """Sets random seeds in several different ways (to guarantee reproducibility)"""
+    t.manual_seed(seed)
+    t.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    t.backends.cudnn.deterministic = True
 
-def rollout_phase(self) -> dict | None:
-    for step in range(self.args.num_steps_per_rollout):
-        infos = self.agent.play_step()
+class PPOTrainer:
+    def __init__(self, args: PPOArgs):
+        set_global_seeds(args.seed)
+        self.args = args
+        self.run_name = f"following__{args.wandb_project_name}__seed{args.seed}__{time.strftime('%Y%m%d-%H%M%S')}"
+        self.envs = EnvVector(args.num_envs)
 
-def learning_phase(self) -> None:
-    minibatches = self.agent.get_minibatches(self.args.gamma, self.args.gae_lambda)
-    for minibatch in minibatches:
-        objective_fn = self.compute_ppo_objective(minibatch)
-        objective_fn.backward()
-        nn.utils.clip_grad_norm_(
-            list(self.actor.parameters()) + list(self.critic.parameters()), self.args.max_grad_norm
+        # Define some basic variables from our environment
+        self.num_envs = args.num_envs
+        self.action_shape = ()
+        self.obs_shape = (NUM_OBS,)
+
+        # Create our replay memory
+        self.memory = ReplayMemory(
+            self.num_envs,
+            self.obs_shape,
+            self.action_shape,
+            args.batch_size,
+            args.minibatch_size,
+            args.batches_per_learning_phase,
+            args.seed,
         )
-        self.optimizer.step()
-        self.optimizer.zero_grad()
-    self.scheduler.step()
 
-def compute_ppo_objective(self, minibatch: ReplayMinibatch) -> Float[Tensor, ""]:
-    logits = self.actor(minibatch.obs)
-    dist = Categorical(logits=logits)
-    values = self.critic(minibatch.obs).squeeze()
+        # Create our networks & optimizer
+        self.actor, self.critic = get_actor_and_critic()
+        self.optimizer, self.scheduler = make_optimizer(self.actor, self.critic, args.total_training_steps, args.lr)
 
-    clipped_surrogate_objective = calc_clipped_surrogate_objective(
-        dist, minibatch.actions, minibatch.advantages, minibatch.logprobs, self.args.clip_coef
-    )
-    value_loss = calc_value_function_loss(values, minibatch.returns, self.args.vf_coef)
-    entropy_bonus = calc_entropy_bonus(dist, self.args.ent_coef)
+        # Create our agent
+        self.agent = PPOAgent(self.envs, self.actor, self.critic, self.memory)
 
-    total_objective_function = clipped_surrogate_objective - value_loss + entropy_bonus
-    return total_objective_function
+    def rollout_phase(self) -> None:
+        for _ in range(self.args.num_steps_per_rollout):
+            self.agent.play_step()
 
-args = PPOArgs(use_wandb=True)
+    def learning_phase(self) -> None:
+        minibatches = self.agent.get_minibatches(self.args.gamma, self.args.gae_lambda)
+        for minibatch in minibatches:
+            objective_fn = self.compute_ppo_objective(minibatch)
+            objective_fn.backward()
+            nn.utils.clip_grad_norm_(
+                list(self.actor.parameters()) + list(self.critic.parameters()), self.args.max_grad_norm
+            )
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+        self.scheduler.step()
+
+    def compute_ppo_objective(self, minibatch: ReplayMinibatch) -> Float[Tensor, ""]:
+        logits = self.actor(minibatch.obs)
+        dist = Categorical(logits=logits)
+        values = self.critic(minibatch.obs).squeeze()
+
+        clipped_surrogate_objective = calc_clipped_surrogate_objective(
+            dist, minibatch.actions, minibatch.advantages, minibatch.logprobs, self.args.clip_coef
+        )
+        value_loss = calc_value_function_loss(values, minibatch.returns, self.args.vf_coef)
+        entropy_bonus = calc_entropy_bonus(dist, self.args.ent_coef)
+
+        total_objective_function = clipped_surrogate_objective - value_loss + entropy_bonus
+        return total_objective_function
+
+    def train(self) -> None:
+        if self.args.use_wandb:
+            wandb.init(
+                project=self.args.wandb_project_name,
+                entity=self.args.wandb_entity,
+                name=self.run_name,
+                monitor_gym=False,
+            )
+            wandb.watch([self.actor, self.critic], log="all", log_freq=50)
+
+        for phase in tqdm(range(self.args.total_phases)):
+            self.rollout_phase()
+            self.learning_phase()
+
+        if self.args.use_wandb:
+            wandb.finish()
+
+print("starting...")
+args = PPOArgs(use_wandb=False)
 trainer = PPOTrainer(args)
 trainer.train()
 
 
 # %%
-
-
-
-
-# %%
-
-
-
-
-# %%
-
-
-
-
-# %%
-
-
-
-
-# %%
-
-
-
-
-# %%
-
-
-
-
-# %%
-
-
-
-
-# %%
-
-
-
-
-# %%
-
-
-
-
-# %%
-
-
-
-
-# %%
-
-
-
-
-# %%
-
-
-
-
-# %%
-
-
-
-
-# %%
-
-
-
-
-# %%
-
-
-
-
-# %%
-
-
-
-
-# %%
-
-
-
-
-# %%
-
-
-
-
-# %%
-
-
-
-
-# %%
-
-
-
-
-# %%
-
-
 
 
